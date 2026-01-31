@@ -1,687 +1,976 @@
 #!/usr/bin/env python3
-"""
-Moltbook CLI (manual interaction)
-- Single-file, copy/paste runnable
-- Menu-driven CLI
-- Secure API key input (hidden) for screenshot/video safety
-- Prints all API responses as colorized JSON
-
-Dependencies:
-  - requests (required)
-  - (optional) rich  -> nicer JSON formatting if installed
-
-Notes:
-  - Uses Authorization: Bearer <api_key> (per server hint).
-  - Refuses unsafe BASE_URLs to prevent accidental key exfiltration.
-"""
-
-from __future__ import annotations
-
-import getpass
 import json
 import os
-import re
 import sys
-import textwrap
+import time
+import getpass
+import socket
+import ssl
+import uuid
+import mimetypes
+import urllib.parse
+import urllib.request
+import urllib.error
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Union, Tuple
 
-try:
-    import requests  # type: ignore
-except ImportError:
-    print("ERROR: Missing dependency 'requests'. Install with: python3 -m pip install requests")
-    sys.exit(1)
+BASE_URL = "https://www.moltbook.com"
+API_BASE = f"{BASE_URL}/api/v1"
+USER_AGENT = "moltbook-cli/2.1"
+DEFAULT_TIMEOUT_SECONDS = 30
+MAX_RETRIES_IDEMPOTENT = 2
+RETRY_BACKOFF_SECONDS = 1.5
 
-# -------------------------------
-# Configuration
-# -------------------------------
-
-BASE_URL = "https://www.moltbook.com/api/v1"
-DEFAULT_TIMEOUT = 30
-ENV_API_KEY_NAME = "MOLTBOOK_API_KEY"
-
-ANSI = {
-    "reset": "\033[0m",
-    "dim": "\033[2m",
-    "bold": "\033[1m",
-    "red": "\033[31m",
-    "green": "\033[32m",
-    "yellow": "\033[33m",
-    "blue": "\033[34m",
-    "magenta": "\033[35m",
-    "cyan": "\033[36m",
-    "gray": "\033[90m",
-}
-
-# Optional richer output
-HAVE_RICH = False
-try:
-    from rich.console import Console  # type: ignore
-    from rich.json import JSON  # type: ignore
-
-    HAVE_RICH = True
-    _console = Console()
-except Exception:
-    HAVE_RICH = False
-    _console = None
+CREDENTIALS_PATH = os.path.expanduser("~/.config/moltbook/credentials.json")
 
 
-def _warn(msg: str) -> None:
-    print(f"{ANSI['yellow']}WARN{ANSI['reset']}: {msg}")
+class ApiError(Exception):
+    def __init__(self, message: str, status: Optional[int] = None, details: Optional[dict] = None):
+        super().__init__(message)
+        self.status = status
+        self.details = details or {}
 
 
-def _err(msg: str) -> None:
-    print(f"{ANSI['red']}ERROR{ANSI['reset']}: {msg}")
+def _ensure_www(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host == "moltbook.com":
+        raise ValueError("Refusing moltbook.com without www (redirect can strip Authorization). Use https://www.moltbook.com")
+    if host and host != "www.moltbook.com":
+        raise ValueError("Refusing to send credentials to a non-moltbook domain.")
+    return url
 
 
-def _ok(msg: str) -> None:
-    print(f"{ANSI['green']}OK{ANSI['reset']}: {msg}")
+def _truncate(s: str, max_len: int = 300) -> str:
+    s = (s or "").strip()
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 3] + "..."
 
 
-def ensure_safe_base_url(base_url: str) -> None:
-    if not base_url.startswith("https://www.moltbook.com/api/v1"):
-        raise ValueError(
-            f"Refusing to use unsafe base URL: {base_url!r}. "
-            f"Must be 'https://www.moltbook.com/api/v1...'"
-        )
+def _pretty_json(obj: Any) -> str:
+    return json.dumps(obj, indent=2, ensure_ascii=False, sort_keys=False)
 
 
-def pause() -> None:
-    input(f"\n{ANSI['dim']}Press Enter to continue...{ANSI['reset']}")
+def _print_section(title: str) -> None:
+    print("\n" + "=" * 88)
+    print(title)
+    print("=" * 88)
 
 
-def prompt(text: str, default: Optional[str] = None) -> str:
-    suffix = f" [{default}]" if default is not None else ""
-    val = input(f"{text}{suffix}: ").strip()
-    return val if val else (default or "")
+def _print_json(obj: Any) -> None:
+    print(_pretty_json(obj))
 
 
-def prompt_int(
-    text: str,
-    default: Optional[int] = None,
-    min_val: Optional[int] = None,
-    max_val: Optional[int] = None,
-) -> int:
+def _prompt_nonempty(prompt: str, max_len: int = 4096) -> str:
     while True:
-        raw = prompt(text, str(default) if default is not None else None)
-        try:
-            n = int(raw)
-            if min_val is not None and n < min_val:
-                _warn(f"Value must be >= {min_val}")
-                continue
-            if max_val is not None and n > max_val:
-                _warn(f"Value must be <= {max_val}")
-                continue
-            return n
-        except ValueError:
-            _warn("Enter a valid integer.")
+        s = input(prompt).strip()
+        if not s:
+            print("Input required.")
+            continue
+        if len(s) > max_len:
+            print(f"Too long (max {max_len} chars).")
+            continue
+        return s
 
 
-def prompt_yes_no(text: str, default_yes: bool = False) -> bool:
-    d = "y" if default_yes else "n"
-    raw = prompt(f"{text} (y/n)", d).lower()
-    return raw.startswith("y")
-
-
-def colorize_json_plain(s: str) -> str:
-    """
-    Lightweight ANSI colorizer for JSON text (no external deps).
-    Colors:
-      - keys: cyan
-      - strings: green
-      - numbers: magenta
-      - booleans/null: yellow
-      - punctuation: gray
-    """
-    import re as _re
-
-    s = _re.sub(r'([{}\[\],:])', f"{ANSI['gray']}\\1{ANSI['reset']}", s)
-
-    s = _re.sub(
-        r'("([^"\\]|\\.)*")(\s*' + _re.escape(f"{ANSI['gray']}:") + r")",
-        lambda m: f"{ANSI['cyan']}{m.group(1)}{ANSI['reset']}{m.group(3)}",
-        s,
-    )
-
-    s = _re.sub(
-        r'("([^"\\]|\\.)*")',
-        lambda m: f"{ANSI['green']}{m.group(1)}{ANSI['reset']}",
-        s,
-    )
-
-    s = _re.sub(
-        r'(?<!")\b-?\d+(\.\d+)?\b(?!")',
-        lambda m: f"{ANSI['magenta']}{m.group(0)}{ANSI['reset']}",
-        s,
-    )
-
-    s = _re.sub(
-        r"\b(true|false|null)\b",
-        lambda m: f"{ANSI['yellow']}{m.group(1)}{ANSI['reset']}",
-        s,
-    )
+def _prompt_optional(prompt: str, max_len: int = 4096) -> Optional[str]:
+    s = input(prompt).strip()
+    if not s:
+        return None
+    if len(s) > max_len:
+        print(f"Too long (max {max_len} chars).")
+        return None
     return s
 
 
-def print_json(data: Any) -> None:
-    if HAVE_RICH and _console is not None:
+def _prompt_int(prompt: str, min_v: int, max_v: int, default: Optional[int] = None) -> int:
+    while True:
+        s = input(prompt).strip()
+        if not s and default is not None:
+            return default
         try:
-            from rich.json import JSON  # type: ignore
+            v = int(s)
+        except ValueError:
+            print("Enter a valid integer.")
+            continue
+        if v < min_v or v > max_v:
+            print(f"Enter a value between {min_v} and {max_v}.")
+            continue
+        return v
 
-            _console.print(JSON.from_data(data))
-            return
-        except Exception:
-            pass
 
-    raw = json.dumps(data, indent=2, ensure_ascii=False)
-    print(colorize_json_plain(raw))
+def _confirm(prompt: str) -> bool:
+    s = input(prompt + " [y/N]: ").strip().lower()
+    return s in ("y", "yes")
 
 
-def sanitize_api_key(raw: str) -> str:
-    """
-    Normalize keys from paste/clipboard:
-    - strip whitespace
-    - remove surrounding quotes
-    - remove common zero-width/invisible characters
-    """
+def _sanitize_key(raw: str) -> str:
     if raw is None:
         return ""
-
     s = raw.strip()
-
-    # Remove surrounding quotes if user pasted `"moltbook_..."` or `'moltbook_...'`
-    if (len(s) >= 2) and ((s[0] == s[-1]) and s[0] in ("'", '"')):
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
         s = s[1:-1].strip()
-
-    # Remove zero-width and BOM chars often introduced by clipboard
     s = s.replace("\u200b", "").replace("\u200c", "").replace("\u200d", "").replace("\ufeff", "")
-
-    # Collapse internal whitespace just in case (keys should never contain spaces)
-    s = re.sub(r"\s+", "", s)
-
+    s = "".join(ch for ch in s if not ch.isspace())
     return s
 
 
-def mask_key(key: str) -> str:
-    """
-    Mask key for debug display: show prefix and suffix only.
-    """
+def _mask_key(key: str) -> str:
     if not key:
         return "<empty>"
     if len(key) <= 12:
-        return key[0:2] + "…" + key[-2:]
+        return key[:2] + "…" + key[-2:]
     return key[:8] + "…" + key[-4:]
 
 
-def get_api_key() -> str:
-    """
-    Securely obtain the API key:
-      1) From env var MOLTBOOK_API_KEY if set
-      2) Otherwise, prompt using getpass (hidden input)
-    """
-    env_val = os.environ.get(ENV_API_KEY_NAME)
-    if env_val and env_val.strip():
-        key = sanitize_api_key(env_val)
-        if key:
-            return key
+def _safe_show_error(err: ApiError) -> None:
+    print(f"\nERROR: {err}")
+    if err.status == 401:
+        print("Hint: invalid/expired API key, or Authorization header not accepted. Ensure https://www.moltbook.com (with www).")
+    if err.status == 403:
+        print("Hint: valid key but not authorized for this action (or not claimed). Check Agent status.")
+    if err.status == 404:
+        print("Hint: endpoint not found; API may have changed or feature isn't enabled for your key.")
+    if err.status == 429:
+        print("Hint: rate limited. Respect retry_after_* fields if present.")
+    if isinstance(err.details, dict) and err.details:
+        hint = err.details.get("hint")
+        if isinstance(hint, str) and hint.strip():
+            print(f"Server hint: {hint.strip()}")
+        ra_s = err.details.get("retry_after_seconds")
+        ra_m = err.details.get("retry_after_minutes")
+        dr = err.details.get("daily_remaining")
+        if ra_s is not None:
+            print(f"Retry after: {ra_s} second(s)")
+        if ra_m is not None:
+            print(f"Retry after: {ra_m} minute(s)")
+        if dr is not None:
+            print(f"Daily remaining: {dr}")
 
-    raw = getpass.getpass("Enter Moltbook API key (input hidden): ")
-    key = sanitize_api_key(raw)
-    if not key:
-        raise ValueError("API key is required (got empty after sanitization).")
-    return key
+
+def _load_saved_credentials() -> Optional[Dict[str, str]]:
+    try:
+        if not os.path.exists(CREDENTIALS_PATH):
+            return None
+        with open(CREDENTIALS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+        api_key = _sanitize_key(str(data.get("api_key", "")).strip())
+        agent_name = str(data.get("agent_name", "")).strip()
+        if api_key:
+            return {"api_key": api_key, "agent_name": agent_name}
+        return None
+    except Exception:
+        return None
+
+
+def _save_credentials(api_key: str, agent_name: str) -> None:
+    os.makedirs(os.path.dirname(CREDENTIALS_PATH), exist_ok=True)
+    payload = {"api_key": api_key, "agent_name": agent_name}
+    raw = json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
+
+    tmp_path = CREDENTIALS_PATH + ".tmp"
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+            f.flush()
+            os.fsync(f.fileno())
+    finally:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+    os.replace(tmp_path, CREDENTIALS_PATH)
+    try:
+        os.chmod(CREDENTIALS_PATH, 0o600)
+    except Exception:
+        pass
+
+
+def _validate_agent_name(name: str) -> Optional[str]:
+    name = name.strip()
+    if not name:
+        return "Name is required."
+    if len(name) > 32:
+        return "Name too long (max 32)."
+    if not (name[0].isalpha() and all(ch.isalnum() or ch == "_" for ch in name)):
+        return "Name must start with a letter and contain only letters, numbers, underscore."
+    return None
+
+
+def _validate_submolt_name(name: str) -> Optional[str]:
+    name = name.strip()
+    if not name:
+        return "Submolt name is required."
+    if len(name) > 32:
+        return "Submolt name too long (max 32)."
+    if not all(ch.isalnum() or ch in ("_", "-") for ch in name):
+        return "Submolt name must be url-safe: letters, numbers, underscore, hyphen."
+    return None
+
+
+def _build_multipart_form(file_field: str, file_path: str, extra_fields: Optional[Dict[str, str]] = None) -> Tuple[bytes, str]:
+    if not os.path.isfile(file_path):
+        raise ValueError("File does not exist.")
+    max_bytes = 2 * 1024 * 1024
+    size = os.path.getsize(file_path)
+    if size > max_bytes:
+        raise ValueError(f"File too large ({size} bytes). Max {max_bytes} bytes.")
+
+    boundary = f"----moltbook-{uuid.uuid4().hex}"
+    ct = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+    filename = os.path.basename(file_path)
+
+    parts: list[bytes] = []
+
+    if extra_fields:
+        for k, v in extra_fields.items():
+            parts.append(f"--{boundary}\r\n".encode("utf-8"))
+            parts.append(f'Content-Disposition: form-data; name="{k}"\r\n\r\n'.encode("utf-8"))
+            parts.append(str(v).encode("utf-8"))
+            parts.append(b"\r\n")
+
+    with open(file_path, "rb") as f:
+        file_bytes = f.read()
+
+    parts.append(f"--{boundary}\r\n".encode("utf-8"))
+    parts.append(
+        f'Content-Disposition: form-data; name="{file_field}"; filename="{filename}"\r\n'.encode("utf-8")
+    )
+    parts.append(f"Content-Type: {ct}\r\n\r\n".encode("utf-8"))
+    parts.append(file_bytes)
+    parts.append(b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+
+    body = b"".join(parts)
+    content_type = f"multipart/form-data; boundary={boundary}"
+    return body, content_type
 
 
 @dataclass
 class MoltbookClient:
-    api_key: str
-    base_url: str = BASE_URL
-    timeout: int = DEFAULT_TIMEOUT
+    api_key: Optional[str] = None
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
     auth_debug: bool = False
 
-    def __post_init__(self) -> None:
-        ensure_safe_base_url(self.base_url)
-        if not self.api_key:
-            raise ValueError("API key is empty.")
-        # FYI only; do not block on prefix because Moltbook keys may vary.
-        if not self.api_key.startswith("moltbook_"):
-            _warn("API key does not start with 'moltbook_'. Proceeding anyway.")
-
-    def _headers(self, content_type_json: bool = False) -> Dict[str, str]:
-        # Per server hint: Authorization: Bearer <api_key>
-        h = {"Authorization": f"Bearer {self.api_key}"}
-        if content_type_json:
-            h["Content-Type"] = "application/json"
-
-        if self.auth_debug:
-            # Debug without leaking secret
-            print(
-                f"{ANSI['dim']}[auth-debug]{ANSI['reset']} "
-                f"Authorization: Bearer {mask_key(self.api_key)}"
-            )
+    def _headers(self, extra: Optional[Dict[str, str]] = None, include_auth: bool = True) -> Dict[str, str]:
+        h: Dict[str, str] = {
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+            "Connection": "close",
+        }
+        if include_auth:
+            if not self.api_key:
+                raise ValueError("API key is not set for this operation.")
+            h["Authorization"] = f"Bearer {self.api_key}"
+            if self.auth_debug:
+                print(f"[auth-debug] Authorization: Bearer {_mask_key(self.api_key)}")
+        if extra:
+            h.update(extra)
         return h
 
     def request(
         self,
         method: str,
         path: str,
-        *,
-        params: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Union[str, int, float, bool]]] = None,
         json_body: Optional[Dict[str, Any]] = None,
-        files: Optional[Dict[str, Any]] = None,
-        data: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[int, Dict[str, Any]]:
-        ensure_safe_base_url(self.base_url)
+        raw_body: Optional[bytes] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
+        expected_json: bool = True,
+        include_auth: bool = True,
+    ) -> Any:
         if not path.startswith("/"):
             path = "/" + path
-        url = self.base_url + path
 
-        # Important: avoid redirects (auth headers can be lost on redirect in some stacks)
-        allow_redirects = False
+        url = _ensure_www(API_BASE + path)
+        if params:
+            qp = {k: str(v) for k, v in params.items() if v is not None}
+            if qp:
+                url = url + "?" + urllib.parse.urlencode(qp, doseq=True)
 
-        headers = self._headers(content_type_json=(json_body is not None))
-        try:
-            resp = requests.request(
-                method=method.upper(),
-                url=url,
-                headers=headers,
-                params=params,
-                json=json_body,
-                files=files,
-                data=data,
-                timeout=self.timeout,
-                allow_redirects=allow_redirects,
-            )
-        except requests.RequestException as e:
-            return 0, {"success": False, "error": str(e), "hint": "Check network connectivity and BASE_URL."}
+        if json_body is not None and raw_body is not None:
+            raise ValueError("Provide either json_body or raw_body, not both.")
 
-        try:
-            payload = resp.json()
-            if not isinstance(payload, dict):
-                payload = {"success": resp.ok, "data": payload}
-        except Exception:
-            payload = {
-                "success": resp.ok,
-                "status_code": resp.status_code,
-                "raw": resp.text,
-                "hint": "Response was not JSON.",
-            }
+        data = None
+        headers = self._headers(extra_headers, include_auth=include_auth)
 
-        payload.setdefault("status_code", resp.status_code)
+        if json_body is not None:
+            data = json.dumps(json_body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        elif raw_body is not None:
+            data = raw_body
 
-        if resp.status_code == 429 and isinstance(payload, dict):
-            payload.setdefault("hint", "Rate limit hit. See retry_after_* fields if present.")
+        req = urllib.request.Request(url=url, method=method.upper(), data=data, headers=headers)
 
-        if resp.is_redirect or resp.status_code in (301, 302, 307, 308):
-            payload.setdefault(
-                "warning",
-                "Redirect received. Ensure you use https://www.moltbook.com with www.",
-            )
-            loc = resp.headers.get("Location")
-            if loc:
-                payload.setdefault("location", loc)
+        is_idempotent = method.upper() in ("GET", "HEAD", "OPTIONS")
+        retries = MAX_RETRIES_IDEMPOTENT if is_idempotent else 0
 
-        return resp.status_code, payload
+        last_exc: Optional[Exception] = None
+        for attempt in range(retries + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
+                    body = resp.read() or b""
+                    if not expected_json:
+                        return body
+                    if not body:
+                        return {}
+                    try:
+                        return json.loads(body.decode("utf-8"))
+                    except json.JSONDecodeError:
+                        raise ApiError("Server returned non-JSON response.", status=getattr(resp, "status", None))
+            except urllib.error.HTTPError as e:
+                status = getattr(e, "code", None)
+                body = b""
+                try:
+                    body = e.read() or b""
+                except Exception:
+                    body = b""
 
-    # -------- Agents --------
-    def me(self) -> Tuple[int, Dict[str, Any]]:
-        return self.request("GET", "/agents/me")
+                parsed = None
+                if body:
+                    try:
+                        parsed = json.loads(body.decode("utf-8", errors="replace"))
+                    except Exception:
+                        parsed = None
 
-    def status(self) -> Tuple[int, Dict[str, Any]]:
-        return self.request("GET", "/agents/status")
+                msg = f"HTTP {status}"
+                if isinstance(parsed, dict):
+                    if isinstance(parsed.get("error"), str):
+                        msg += f": {parsed['error']}"
+                    elif isinstance(parsed.get("message"), str):
+                        msg += f": {parsed['message']}"
+                else:
+                    txt = body.decode("utf-8", errors="replace").strip()
+                    if txt:
+                        msg += f": {_truncate(txt, 200)}"
 
-    def profile(self, name: str) -> Tuple[int, Dict[str, Any]]:
-        return self.request("GET", "/agents/profile", params={"name": name})
+                raise ApiError(msg, status=status, details=parsed if isinstance(parsed, dict) else {})
+            except (TimeoutError, socket.timeout) as e:
+                last_exc = e
+                if attempt < retries:
+                    time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+                    continue
+                raise ApiError("Request timed out. Increase timeout or retry later.") from e
+            except ssl.SSLError as e:
+                raise ApiError(f"TLS/SSL error: {_truncate(str(e), 200)}") from e
+            except urllib.error.URLError as e:
+                reason = getattr(e, "reason", None)
+                if isinstance(reason, (TimeoutError, socket.timeout)):
+                    last_exc = e
+                    if attempt < retries:
+                        time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+                        continue
+                    raise ApiError("Request timed out. Increase timeout or retry later.") from e
+                raise ApiError(f"Network error: {_truncate(str(reason), 200)}") from e
+            except Exception as e:
+                last_exc = e
+                raise ApiError(f"Unexpected error: {_truncate(str(e), 200)}") from e
 
-    # -------- Posts --------
-    def get_feed_global(self, sort: str = "hot", limit: int = 25, submolt: Optional[str] = None) -> Tuple[int, Dict[str, Any]]:
-        params: Dict[str, Any] = {"sort": sort, "limit": limit}
-        if submolt:
-            params["submolt"] = submolt
-        return self.request("GET", "/posts", params=params)
+        raise ApiError(f"Request failed: {_truncate(str(last_exc), 200)}")
 
-    def get_feed_personal(self, sort: str = "hot", limit: int = 25) -> Tuple[int, Dict[str, Any]]:
-        return self.request("GET", "/feed", params={"sort": sort, "limit": limit})
+    def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        return self.request("GET", path, params=params, include_auth=True)
 
-    def get_submolt_feed(self, submolt: str, sort: str = "new") -> Tuple[int, Dict[str, Any]]:
-        return self.request("GET", f"/submolts/{submolt}/feed", params={"sort": sort})
+    def post(self, path: str, json_body: Optional[Dict[str, Any]] = None) -> Any:
+        return self.request("POST", path, json_body=json_body, include_auth=True)
 
-    def get_post(self, post_id: str) -> Tuple[int, Dict[str, Any]]:
-        return self.request("GET", f"/posts/{post_id}")
+    def delete(self, path: str, json_body: Optional[Dict[str, Any]] = None) -> Any:
+        return self.request("DELETE", path, json_body=json_body, include_auth=True)
 
-    def create_post(self, submolt: str, title: str, content: Optional[str] = None, url: Optional[str] = None) -> Tuple[int, Dict[str, Any]]:
-        body: Dict[str, Any] = {"submolt": submolt, "title": title}
-        if content:
-            body["content"] = content
-        if url:
-            body["url"] = url
-        return self.request("POST", "/posts", json_body=body)
+    def patch(self, path: str, json_body: Optional[Dict[str, Any]] = None) -> Any:
+        return self.request("PATCH", path, json_body=json_body, include_auth=True)
 
-    def delete_post(self, post_id: str) -> Tuple[int, Dict[str, Any]]:
-        return self.request("DELETE", f"/posts/{post_id}")
+    # Registration is unauthenticated
+    def register_agent(self, name: str, description: str) -> Any:
+        return self.request("POST", "/agents/register", json_body={"name": name, "description": description}, include_auth=False)
 
-    # -------- Comments --------
-    def get_comments(self, post_id: str, sort: str = "top") -> Tuple[int, Dict[str, Any]]:
-        return self.request("GET", f"/posts/{post_id}/comments", params={"sort": sort})
-
-    def add_comment(self, post_id: str, content: str, parent_id: Optional[str] = None) -> Tuple[int, Dict[str, Any]]:
-        body: Dict[str, Any] = {"content": content}
-        if parent_id:
-            body["parent_id"] = parent_id
-        return self.request("POST", f"/posts/{post_id}/comments", json_body=body)
-
-    # -------- Voting --------
-    def upvote_post(self, post_id: str) -> Tuple[int, Dict[str, Any]]:
-        return self.request("POST", f"/posts/{post_id}/upvote")
-
-    def downvote_post(self, post_id: str) -> Tuple[int, Dict[str, Any]]:
-        return self.request("POST", f"/posts/{post_id}/downvote")
-
-    def upvote_comment(self, comment_id: str) -> Tuple[int, Dict[str, Any]]:
-        return self.request("POST", f"/comments/{comment_id}/upvote")
-
-    # -------- Submolts --------
-    def list_submolts(self) -> Tuple[int, Dict[str, Any]]:
-        return self.request("GET", "/submolts")
-
-    def get_submolt(self, name: str) -> Tuple[int, Dict[str, Any]]:
-        return self.request("GET", f"/submolts/{name}")
-
-    def create_submolt(self, name: str, display_name: str, description: str) -> Tuple[int, Dict[str, Any]]:
-        body = {"name": name, "display_name": display_name, "description": description}
-        return self.request("POST", "/submolts", json_body=body)
-
-    def subscribe_submolt(self, name: str) -> Tuple[int, Dict[str, Any]]:
-        return self.request("POST", f"/submolts/{name}/subscribe")
-
-    def unsubscribe_submolt(self, name: str) -> Tuple[int, Dict[str, Any]]:
-        return self.request("DELETE", f"/submolts/{name}/subscribe")
-
-    # -------- Following --------
-    def follow(self, agent_name: str) -> Tuple[int, Dict[str, Any]]:
-        return self.request("POST", f"/agents/{agent_name}/follow")
-
-    def unfollow(self, agent_name: str) -> Tuple[int, Dict[str, Any]]:
-        return self.request("DELETE", f"/agents/{agent_name}/follow")
-
-    # -------- Search --------
-    def search(self, q: str, search_type: str = "all", limit: int = 20) -> Tuple[int, Dict[str, Any]]:
-        return self.request("GET", "/search", params={"q": q, "type": search_type, "limit": limit})
-
-    # -------- DMs --------
-    def dm_check(self) -> Tuple[int, Dict[str, Any]]:
-        return self.request("GET", "/agents/dm/check")
-
-    def dm_requests(self) -> Tuple[int, Dict[str, Any]]:
-        return self.request("GET", "/agents/dm/requests")
-
-    def dm_approve(self, conversation_id: str) -> Tuple[int, Dict[str, Any]]:
-        return self.request("POST", f"/agents/dm/requests/{conversation_id}/approve")
-
-    def dm_conversations(self) -> Tuple[int, Dict[str, Any]]:
-        return self.request("GET", "/agents/dm/conversations")
-
-    def dm_read_conversation(self, conversation_id: str) -> Tuple[int, Dict[str, Any]]:
-        return self.request("GET", f"/agents/dm/conversations/{conversation_id}")
-
-    def dm_send(self, conversation_id: str, message: str) -> Tuple[int, Dict[str, Any]]:
-        return self.request("POST", f"/agents/dm/conversations/{conversation_id}/send", json_body={"message": message})
-
-    def dm_request(self, to: str, message: str) -> Tuple[int, Dict[str, Any]]:
-        return self.request("POST", "/agents/dm/request", json_body={"to": to, "message": message})
+    def post_multipart(self, path: str, body: bytes, content_type: str) -> Any:
+        return self.request(
+            "POST",
+            path,
+            raw_body=body,
+            extra_headers={"Content-Type": content_type},
+            include_auth=True,
+        )
 
 
-def print_http_result(status: int, payload: Dict[str, Any]) -> None:
-    if status == 0:
-        _err("Request failed to send.")
-    elif 200 <= status < 300:
-        _ok(f"HTTP {status}")
-    elif status == 429:
-        _warn("HTTP 429 (rate limited)")
-    else:
-        _err(f"HTTP {status}")
-    print_json(payload)
+def _bootstrap() -> MoltbookClient:
+    client = MoltbookClient(api_key=None, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, auth_debug=False)
 
+    saved = _load_saved_credentials()
+    if saved and saved.get("api_key"):
+        client.api_key = saved["api_key"]
+        return client
 
-def banner() -> None:
-    print(f"{ANSI['bold']}Moltbook CLI{ANSI['reset']}  {ANSI['dim']}manual API interaction{ANSI['reset']}")
-    print(f"Base URL: {ANSI['cyan']}{BASE_URL}{ANSI['reset']}")
-    print(f"{ANSI['dim']}Tip: set {ENV_API_KEY_NAME} to avoid prompting.{ANSI['reset']}")
-    print()
+    env_key = _sanitize_key(os.environ.get("MOLTBOOK_API_KEY", ""))
+    if env_key:
+        client.api_key = env_key
+        return client
+
+    _print_section("Bootstrap")
+    print("No API key found in env or saved credentials.")
+    print("1) Register a new agent (get an API key)")
+    print("2) Enter an existing API key")
+    print("0) Quit")
+    c = _prompt_int("Select: ", 0, 2)
+    if c == 0:
+        raise SystemExit(0)
+    if c == 2:
+        client.api_key = _sanitize_key(getpass.getpass("Enter Moltbook API key (hidden): "))
+        if not client.api_key:
+            raise ValueError("API key required.")
+        return client
+
+    # c == 1: register
+    _print_section("Register agent (no API key required)")
+    name = _prompt_nonempty("Agent name: ", max_len=64)
+    err = _validate_agent_name(name)
+    if err:
+        raise ValueError(f"Invalid name: {err}")
+    desc = _prompt_nonempty("Description: ", max_len=300)
+    data = client.register_agent(name=name, description=desc)
+    _print_json(data)
+
+    agent = data.get("agent") if isinstance(data, dict) else None
+    if not isinstance(agent, dict):
+        raise ApiError("Registration succeeded but response missing agent object.")
+    new_key = _sanitize_key(str(agent.get("api_key", "")).strip())
+    if not new_key:
+        raise ApiError("Registration response missing api_key.")
+    claim_url = str(agent.get("claim_url", "")).strip()
+    verification_code = str(agent.get("verification_code", "")).strip()
+
+    print("\nIMPORTANT: Save your new API key and claim URL now.")
+    print(f"API key (masked): {_mask_key(new_key)}")
+    if claim_url:
+        print(f"Claim URL: {claim_url}")
+    if verification_code:
+        print(f"Verification code: {verification_code}")
+
+    if _confirm("Save credentials to ~/.config/moltbook/credentials.json (0600)?"):
+        _save_credentials(new_key, name)
+        print("Saved.")
+    client.api_key = new_key
+    return client
 
 
 def menu() -> None:
-    print(
-        textwrap.dedent(
-            f"""
-    {ANSI['bold']}Main Menu{ANSI['reset']}
-      1) Agent: me
-      2) Agent: claim status
-      3) Agent: view profile (by name)
-      4) Posts: personal feed (subscribed + followed)
-      5) Posts: global feed
-      6) Posts: submolt feed
-      7) Posts: get single post
-      8) Posts: create post
-      9) Posts: delete post
-     10) Comments: list on a post
-     11) Comments: add to a post (or reply)
-     12) Voting: upvote post
-     13) Voting: downvote post
-     14) Voting: upvote comment
-     15) Submolts: list
-     16) Submolts: get info
-     17) Submolts: create
-     18) Submolts: subscribe
-     19) Submolts: unsubscribe
-     20) Following: follow agent
-     21) Following: unfollow agent
-     22) Search: semantic search
-     23) DMs: check
-     24) DMs: list requests
-     25) DMs: approve request
-     26) DMs: list conversations
-     27) DMs: read conversation
-     28) DMs: send message
-     29) DMs: start new DM request
-      0) Exit
-    """
-        ).strip()
-    )
-
-
-def main() -> None:
-    banner()
-    ensure_safe_base_url(BASE_URL)
-
-    api_key = get_api_key()
-
-    # Optional: print masked auth debug line (safe for recordings)
-    auth_debug = prompt_yes_no("Enable auth debug (masked token display)?", default_yes=True)
-
-    client = MoltbookClient(api_key=api_key, auth_debug=auth_debug)
-
-    # Hardening: remove local reference to the key after client creation
-    del api_key
+    client = _bootstrap()
 
     while True:
-        print()
-        menu()
-        choice = prompt_int("\nSelect", min_val=0, max_val=29)
+        _print_section("Moltbook CLI")
+        print("1) Register agent (creates new API key + claim URL)")
+        print("2) Agent status")
+        print("3) My profile (agents/me)")
+        print("4) View agent profile (agents/profile)")
+        print("5) Update my profile (PATCH agents/me)")
+        print("6) Upload my avatar (POST agents/me/avatar)")
+        print("7) Remove my avatar (DELETE agents/me/avatar)")
+        print("8) Check DMs (quick)")
+        print("9) List DM requests (pending)")
+        print("10) Approve a DM request")
+        print("11) Reject a DM request (optional block)")
+        print("12) List DM conversations")
+        print("13) Read a DM conversation")
+        print("14) Send DM message")
+        print("15) Send DM request")
+        print("16) Feed (personalized)")
+        print("17) Posts (global)")
+        print("18) View post")
+        print("19) Create post")
+        print("20) Delete post")
+        print("21) List comments on post")
+        print("22) Comment on a post (or reply)")
+        print("23) Upvote post")
+        print("24) Downvote post")
+        print("25) Upvote comment")
+        print("26) Pin post")
+        print("27) Unpin post")
+        print("28) Search (semantic)")
+        print("29) List submolts")
+        print("30) View submolt")
+        print("31) Create submolt")
+        print("32) Subscribe submolt")
+        print("33) Unsubscribe submolt")
+        print("34) Update submolt settings (PATCH)")
+        print("35) Upload submolt avatar/banner")
+        print("36) Add submolt moderator")
+        print("37) Remove submolt moderator")
+        print("38) List submolt moderators")
+        print("39) Follow agent")
+        print("40) Unfollow agent")
+        print("41) Set timeout")
+        print("42) Toggle auth debug (masked)")
+        print("43) Switch API key")
+        print("0) Quit")
+
+        choice = _prompt_int("\nSelect: ", 0, 43)
 
         try:
             if choice == 0:
-                print("Exiting.")
                 return
 
-            elif choice == 1:
-                status, payload = client.me()
-                print_http_result(status, payload)
+            if choice == 1:
+                _print_section("Register agent (no API key required)")
+                name = _prompt_nonempty("Agent name: ", max_len=64)
+                err = _validate_agent_name(name)
+                if err:
+                    print(f"Invalid name: {err}")
+                else:
+                    desc = _prompt_nonempty("Description: ", max_len=300)
+                    data = client.register_agent(name=name, description=desc)
+                    _print_json(data)
+
+                    agent = data.get("agent") if isinstance(data, dict) else None
+                    if isinstance(agent, dict):
+                        new_key = _sanitize_key(str(agent.get("api_key", "")).strip())
+                        claim_url = str(agent.get("claim_url", "")).strip()
+                        verification_code = str(agent.get("verification_code", "")).strip()
+
+                        if new_key:
+                            print("\nIMPORTANT: Save your new API key and claim URL now.")
+                            print(f"API key (masked): {_mask_key(new_key)}")
+                            if claim_url:
+                                print(f"Claim URL: {claim_url}")
+                            if verification_code:
+                                print(f"Verification code: {verification_code}")
+
+                            if _confirm("Save credentials to ~/.config/moltbook/credentials.json (0600)?"):
+                                _save_credentials(new_key, name)
+                                print("Saved.")
+                            if _confirm("Use this new API key for the rest of this session?"):
+                                client.api_key = new_key
+                                print("Active API key updated.")
 
             elif choice == 2:
-                status, payload = client.status()
-                print_http_result(status, payload)
+                _print_section("Agent status")
+                data = client.get("/agents/status")
+                _print_json(data)
 
             elif choice == 3:
-                name = prompt("Agent name (MOLTY_NAME)")
-                status, payload = client.profile(name)
-                print_http_result(status, payload)
+                _print_section("My profile")
+                data = client.get("/agents/me")
+                _print_json(data)
 
             elif choice == 4:
-                sort = prompt("Sort (hot/new/top)", "hot")
-                limit = prompt_int("Limit", 25, 1, 50)
-                status, payload = client.get_feed_personal(sort=sort, limit=limit)
-                print_http_result(status, payload)
+                name = _prompt_nonempty("Agent name (MOLTY_NAME): ", max_len=64)
+                _print_section(f"Agent profile: {name}")
+                data = client.get("/agents/profile", params={"name": name})
+                _print_json(data)
 
             elif choice == 5:
-                sort = prompt("Sort (hot/new/top/rising)", "hot")
-                limit = prompt_int("Limit", 25, 1, 50)
-                status, payload = client.get_feed_global(sort=sort, limit=limit)
-                print_http_result(status, payload)
+                _print_section("Update my profile (PATCH)")
+                desc = _prompt_optional("New description (blank to skip): ", max_len=300)
+                meta_raw = _prompt_optional("Metadata JSON (blank to skip): ", max_len=4000)
+                payload: Dict[str, Any] = {}
+                if desc:
+                    payload["description"] = desc
+                if meta_raw:
+                    try:
+                        meta = json.loads(meta_raw)
+                        payload["metadata"] = meta
+                    except Exception:
+                        print("Invalid JSON for metadata.")
+                if not payload:
+                    print("Nothing to update.")
+                else:
+                    data = client.patch("/agents/me", json_body=payload)
+                    _print_json(data)
 
             elif choice == 6:
-                submolt = prompt("Submolt name", "general")
-                sort = prompt("Sort (new/hot/top/rising)", "new")
-                status, payload = client.get_submolt_feed(submolt=submolt, sort=sort)
-                print_http_result(status, payload)
+                _print_section("Upload my avatar")
+                path = _prompt_nonempty("Image path: ", max_len=1024)
+                body, ct = _build_multipart_form("file", path, extra_fields=None)
+                data = client.post_multipart("/agents/me/avatar", body, ct)
+                _print_json(data)
 
             elif choice == 7:
-                post_id = prompt("POST_ID")
-                status, payload = client.get_post(post_id)
-                print_http_result(status, payload)
+                _print_section("Remove my avatar")
+                data = client.delete("/agents/me/avatar")
+                _print_json(data)
 
             elif choice == 8:
-                submolt = prompt("Submolt", "general")
-                title = prompt("Title")
-                is_link = prompt_yes_no("Link post?", default_yes=False)
-                if is_link:
-                    url = prompt("URL (https://...)")
-                    status, payload = client.create_post(submolt=submolt, title=title, url=url)
-                else:
-                    content = prompt("Content")
-                    status, payload = client.create_post(submolt=submolt, title=title, content=content)
-                print_http_result(status, payload)
+                _print_section("DM check")
+                data = client.get("/agents/dm/check")
+                _print_json(data)
 
             elif choice == 9:
-                post_id = prompt("POST_ID")
-                status, payload = client.delete_post(post_id)
-                print_http_result(status, payload)
+                _print_section("DM requests (pending)")
+                data = client.get("/agents/dm/requests")
+                _print_json(data)
 
             elif choice == 10:
-                post_id = prompt("POST_ID")
-                sort = prompt("Sort (top/new/controversial)", "top")
-                status, payload = client.get_comments(post_id, sort=sort)
-                print_http_result(status, payload)
+                conv_id = _prompt_nonempty("Request conversation ID to approve: ", max_len=200)
+                _print_section("Approve request")
+                data = client.post(f"/agents/dm/requests/{urllib.parse.quote(conv_id, safe='')}/approve")
+                _print_json(data)
 
             elif choice == 11:
-                post_id = prompt("POST_ID")
-                content = prompt("Comment content")
-                parent_id = prompt("Parent COMMENT_ID (blank if top-level)", "")
-                status, payload = client.add_comment(post_id, content=content, parent_id=(parent_id or None))
-                print_http_result(status, payload)
+                conv_id = _prompt_nonempty("Request conversation ID to reject: ", max_len=200)
+                block = _confirm("Also block future requests from this agent?")
+                payload = {"block": True} if block else None
+                _print_section("Reject request")
+                data = client.post(f"/agents/dm/requests/{urllib.parse.quote(conv_id, safe='')}/reject", json_body=payload)
+                _print_json(data)
 
             elif choice == 12:
-                post_id = prompt("POST_ID")
-                status, payload = client.upvote_post(post_id)
-                print_http_result(status, payload)
+                _print_section("DM conversations")
+                data = client.get("/agents/dm/conversations")
+                _print_json(data)
 
             elif choice == 13:
-                post_id = prompt("POST_ID")
-                status, payload = client.downvote_post(post_id)
-                print_http_result(status, payload)
+                conv_id = _prompt_nonempty("Conversation ID: ", max_len=200)
+                _print_section(f"DM conversation: {conv_id}")
+                data = client.get(f"/agents/dm/conversations/{urllib.parse.quote(conv_id, safe='')}")
+                _print_json(data)
 
             elif choice == 14:
-                comment_id = prompt("COMMENT_ID")
-                status, payload = client.upvote_comment(comment_id)
-                print_http_result(status, payload)
+                conv_id = _prompt_nonempty("Conversation ID: ", max_len=200)
+                msg = _prompt_nonempty("Message: ", max_len=1000)
+                needs_human = _confirm("Flag needs_human_input")
+                payload: Dict[str, Any] = {"message": msg}
+                if needs_human:
+                    payload["needs_human_input"] = True
+                _print_section("Send DM message")
+                data = client.post(f"/agents/dm/conversations/{urllib.parse.quote(conv_id, safe='')}/send", json_body=payload)
+                _print_json(data)
 
             elif choice == 15:
-                status, payload = client.list_submolts()
-                print_http_result(status, payload)
+                to = _prompt_optional("To (bot name) [blank to use to_owner]: ", max_len=200)
+                to_owner = None
+                if not to:
+                    to_owner = _prompt_nonempty("To owner X handle (with or without @): ", max_len=200)
+                    if to_owner.startswith("@"):
+                        to_owner = to_owner[1:]
+                msg = _prompt_nonempty("Request message (10-1000 chars): ", max_len=1000)
+                if len(msg) < 10:
+                    print("Message too short (min 10 chars).")
+                else:
+                    payload: Dict[str, Any] = {"message": msg}
+                    if to:
+                        payload["to"] = to
+                    else:
+                        payload["to_owner"] = to_owner
+                    _print_section("Send DM request")
+                    data = client.post("/agents/dm/request", json_body=payload)
+                    _print_json(data)
 
             elif choice == 16:
-                name = prompt("Submolt name")
-                status, payload = client.get_submolt(name)
-                print_http_result(status, payload)
+                sort = _prompt_optional("Sort [hot/new/top] (default new): ", max_len=10) or "new"
+                if sort not in ("hot", "new", "top"):
+                    print("Invalid sort. Using 'new'.")
+                    sort = "new"
+                limit = _prompt_int("Limit (1-50, default 15): ", 1, 50, default=15)
+                _print_section("Personalized feed")
+                data = client.get("/feed", params={"sort": sort, "limit": limit})
+                _print_json(data)
 
             elif choice == 17:
-                name = prompt("Submolt name (short, url-safe)")
-                display_name = prompt("Display name")
-                description = prompt("Description")
-                status, payload = client.create_submolt(name, display_name, description)
-                print_http_result(status, payload)
+                sort = _prompt_optional("Sort [hot/new/top/rising] (default new): ", max_len=10) or "new"
+                if sort not in ("hot", "new", "top", "rising"):
+                    print("Invalid sort. Using 'new'.")
+                    sort = "new"
+                limit = _prompt_int("Limit (1-50, default 15): ", 1, 50, default=15)
+                submolt = _prompt_optional("Submolt (optional): ", max_len=64)
+                params: Dict[str, Any] = {"sort": sort, "limit": limit}
+                if submolt:
+                    params["submolt"] = submolt
+                _print_section("Posts")
+                data = client.get("/posts", params=params)
+                _print_json(data)
 
             elif choice == 18:
-                name = prompt("Submolt name")
-                status, payload = client.subscribe_submolt(name)
-                print_http_result(status, payload)
+                post_id = _prompt_nonempty("Post ID: ", max_len=200)
+                _print_section(f"Post: {post_id}")
+                data = client.get(f"/posts/{urllib.parse.quote(post_id, safe='')}")
+                _print_json(data)
 
             elif choice == 19:
-                name = prompt("Submolt name")
-                status, payload = client.unsubscribe_submolt(name)
-                print_http_result(status, payload)
+                submolt = _prompt_nonempty("Submolt (e.g., general): ", max_len=64)
+                title = _prompt_nonempty("Title: ", max_len=200)
+                content = _prompt_optional("Content (optional if URL post): ", max_len=20000)
+                url = _prompt_optional("URL (optional for link post): ", max_len=2000)
+                if not content and not url:
+                    print("Must provide either content or url.")
+                else:
+                    payload: Dict[str, Any] = {"submolt": submolt, "title": title}
+                    if content:
+                        payload["content"] = content
+                    if url:
+                        payload["url"] = url
+                    _print_section("Create post")
+                    data = client.post("/posts", json_body=payload)
+                    _print_json(data)
 
             elif choice == 20:
-                agent_name = prompt("MOLTY_NAME to follow")
-                status, payload = client.follow(agent_name)
-                print_http_result(status, payload)
+                post_id = _prompt_nonempty("Post ID: ", max_len=200)
+                _print_section("Delete post")
+                data = client.delete(f"/posts/{urllib.parse.quote(post_id, safe='')}")
+                _print_json(data)
 
             elif choice == 21:
-                agent_name = prompt("MOLTY_NAME to unfollow")
-                status, payload = client.unfollow(agent_name)
-                print_http_result(status, payload)
+                post_id = _prompt_nonempty("Post ID: ", max_len=200)
+                sort = _prompt_optional("Sort [top/new/controversial] (default top): ", max_len=20) or "top"
+                if sort not in ("top", "new", "controversial"):
+                    print("Invalid sort. Using 'top'.")
+                    sort = "top"
+                _print_section("Comments")
+                data = client.get(f"/posts/{urllib.parse.quote(post_id, safe='')}/comments", params={"sort": sort})
+                _print_json(data)
 
             elif choice == 22:
-                q = prompt("Search query (natural language)")
-                search_type = prompt("Type (all/posts/comments)", "all")
-                limit = prompt_int("Limit", 20, 1, 50)
-                status, payload = client.search(q=q, search_type=search_type, limit=limit)
-                print_http_result(status, payload)
+                post_id = _prompt_nonempty("Post ID: ", max_len=200)
+                content = _prompt_nonempty("Comment content: ", max_len=5000)
+                parent_id = _prompt_optional("Parent comment ID (optional): ", max_len=200)
+                payload: Dict[str, Any] = {"content": content}
+                if parent_id:
+                    payload["parent_id"] = parent_id
+                _print_section("Create comment")
+                data = client.post(f"/posts/{urllib.parse.quote(post_id, safe='')}/comments", json_body=payload)
+                _print_json(data)
 
             elif choice == 23:
-                status, payload = client.dm_check()
-                print_http_result(status, payload)
+                post_id = _prompt_nonempty("Post ID: ", max_len=200)
+                _print_section("Upvote post")
+                data = client.post(f"/posts/{urllib.parse.quote(post_id, safe='')}/upvote")
+                _print_json(data)
 
             elif choice == 24:
-                status, payload = client.dm_requests()
-                print_http_result(status, payload)
+                post_id = _prompt_nonempty("Post ID: ", max_len=200)
+                _print_section("Downvote post")
+                data = client.post(f"/posts/{urllib.parse.quote(post_id, safe='')}/downvote")
+                _print_json(data)
 
             elif choice == 25:
-                conv_id = prompt("CONVERSATION_ID")
-                status, payload = client.dm_approve(conv_id)
-                print_http_result(status, payload)
+                comment_id = _prompt_nonempty("Comment ID: ", max_len=200)
+                _print_section("Upvote comment")
+                data = client.post(f"/comments/{urllib.parse.quote(comment_id, safe='')}/upvote")
+                _print_json(data)
 
             elif choice == 26:
-                status, payload = client.dm_conversations()
-                print_http_result(status, payload)
+                post_id = _prompt_nonempty("Post ID: ", max_len=200)
+                _print_section("Pin post")
+                data = client.post(f"/posts/{urllib.parse.quote(post_id, safe='')}/pin")
+                _print_json(data)
 
             elif choice == 27:
-                conv_id = prompt("CONVERSATION_ID")
-                status, payload = client.dm_read_conversation(conv_id)
-                print_http_result(status, payload)
+                post_id = _prompt_nonempty("Post ID: ", max_len=200)
+                _print_section("Unpin post")
+                data = client.delete(f"/posts/{urllib.parse.quote(post_id, safe='')}/pin")
+                _print_json(data)
 
             elif choice == 28:
-                conv_id = prompt("CONVERSATION_ID")
-                message = prompt("Message")
-                status, payload = client.dm_send(conv_id, message)
-                print_http_result(status, payload)
+                q = _prompt_nonempty("Search query (max 500 chars): ", max_len=500)
+                t = _prompt_optional("Type [posts/comments/all] (default all): ", max_len=10) or "all"
+                if t not in ("posts", "comments", "all"):
+                    print("Invalid type. Using 'all'.")
+                    t = "all"
+                limit = _prompt_int("Limit (1-50, default 20): ", 1, 50, default=20)
+                _print_section("Search results")
+                data = client.get("/search", params={"q": q, "type": t, "limit": limit})
+                _print_json(data)
 
             elif choice == 29:
-                to = prompt("OtherMoltyName (to)")
-                message = prompt("Initial message")
-                status, payload = client.dm_request(to, message)
-                print_http_result(status, payload)
+                _print_section("Submolts")
+                data = client.get("/submolts")
+                _print_json(data)
 
-        except ValueError as ve:
-            _err(str(ve))
+            elif choice == 30:
+                name = _prompt_nonempty("Submolt name: ", max_len=64)
+                err = _validate_submolt_name(name)
+                if err:
+                    print(f"Invalid submolt name: {err}")
+                else:
+                    _print_section(f"Submolt: {name}")
+                    data = client.get(f"/submolts/{urllib.parse.quote(name, safe='')}")
+                    _print_json(data)
+
+            elif choice == 31:
+                name = _prompt_nonempty("Submolt name (url-safe): ", max_len=64)
+                err = _validate_submolt_name(name)
+                if err:
+                    print(f"Invalid submolt name: {err}")
+                else:
+                    display_name = _prompt_nonempty("Display name: ", max_len=64)
+                    description = _prompt_nonempty("Description: ", max_len=300)
+                    _print_section("Create submolt")
+                    data = client.post("/submolts", json_body={"name": name, "display_name": display_name, "description": description})
+                    _print_json(data)
+
+            elif choice == 32:
+                name = _prompt_nonempty("Submolt name: ", max_len=64)
+                err = _validate_submolt_name(name)
+                if err:
+                    print(f"Invalid submolt name: {err}")
+                else:
+                    _print_section("Subscribe")
+                    data = client.post(f"/submolts/{urllib.parse.quote(name, safe='')}/subscribe")
+                    _print_json(data)
+
+            elif choice == 33:
+                name = _prompt_nonempty("Submolt name: ", max_len=64)
+                err = _validate_submolt_name(name)
+                if err:
+                    print(f"Invalid submolt name: {err}")
+                else:
+                    _print_section("Unsubscribe")
+                    data = client.delete(f"/submolts/{urllib.parse.quote(name, safe='')}/subscribe")
+                    _print_json(data)
+
+            elif choice == 34:
+                name = _prompt_nonempty("Submolt name: ", max_len=64)
+                err = _validate_submolt_name(name)
+                if err:
+                    print(f"Invalid submolt name: {err}")
+                else:
+                    desc = _prompt_optional("New description (blank to skip): ", max_len=300)
+                    banner_color = _prompt_optional("Banner color (e.g. #1a1a2e) blank to skip: ", max_len=16)
+                    theme_color = _prompt_optional("Theme color (e.g. #ff4500) blank to skip: ", max_len=16)
+                    payload: Dict[str, Any] = {}
+                    if desc:
+                        payload["description"] = desc
+                    if banner_color:
+                        payload["banner_color"] = banner_color
+                    if theme_color:
+                        payload["theme_color"] = theme_color
+                    if not payload:
+                        print("Nothing to update.")
+                    else:
+                        _print_section("Update submolt settings")
+                        data = client.patch(f"/submolts/{urllib.parse.quote(name, safe='')}/settings", json_body=payload)
+                        _print_json(data)
+
+            elif choice == 35:
+                name = _prompt_nonempty("Submolt name: ", max_len=64)
+                err = _validate_submolt_name(name)
+                if err:
+                    print(f"Invalid submolt name: {err}")
+                else:
+                    t = _prompt_nonempty("Upload type [avatar/banner]: ", max_len=10).lower()
+                    if t not in ("avatar", "banner"):
+                        print("Invalid type.")
+                    else:
+                        path = _prompt_nonempty("Image path: ", max_len=1024)
+                        body, ct = _build_multipart_form("file", path, extra_fields={"type": t})
+                        _print_section(f"Upload submolt {t}")
+                        data = client.post_multipart(f"/submolts/{urllib.parse.quote(name, safe='')}/settings", body, ct)
+                        _print_json(data)
+
+            elif choice == 36:
+                name = _prompt_nonempty("Submolt name: ", max_len=64)
+                err = _validate_submolt_name(name)
+                if err:
+                    print(f"Invalid submolt name: {err}")
+                else:
+                    agent = _prompt_nonempty("Agent name to add: ", max_len=64)
+                    role = _prompt_optional("Role (default moderator): ", max_len=16) or "moderator"
+                    if role not in ("moderator", "owner"):
+                        print("Invalid role. Using 'moderator'.")
+                        role = "moderator"
+                    _print_section("Add moderator")
+                    data = client.post(f"/submolts/{urllib.parse.quote(name, safe='')}/moderators", json_body={"agent_name": agent, "role": role})
+                    _print_json(data)
+
+            elif choice == 37:
+                name = _prompt_nonempty("Submolt name: ", max_len=64)
+                err = _validate_submolt_name(name)
+                if err:
+                    print(f"Invalid submolt name: {err}")
+                else:
+                    agent = _prompt_nonempty("Agent name to remove: ", max_len=64)
+                    _print_section("Remove moderator")
+                    data = client.delete(f"/submolts/{urllib.parse.quote(name, safe='')}/moderators", json_body={"agent_name": agent})
+                    _print_json(data)
+
+            elif choice == 38:
+                name = _prompt_nonempty("Submolt name: ", max_len=64)
+                err = _validate_submolt_name(name)
+                if err:
+                    print(f"Invalid submolt name: {err}")
+                else:
+                    _print_section("List moderators")
+                    data = client.get(f"/submolts/{urllib.parse.quote(name, safe='')}/moderators")
+                    _print_json(data)
+
+            elif choice == 39:
+                agent = _prompt_nonempty("Agent name to follow: ", max_len=64)
+                _print_section("Follow agent")
+                data = client.post(f"/agents/{urllib.parse.quote(agent, safe='')}/follow")
+                _print_json(data)
+
+            elif choice == 40:
+                agent = _prompt_nonempty("Agent name to unfollow: ", max_len=64)
+                _print_section("Unfollow agent")
+                data = client.delete(f"/agents/{urllib.parse.quote(agent, safe='')}/follow")
+                _print_json(data)
+
+            elif choice == 41:
+                v = _prompt_int("Timeout seconds (5-180): ", 5, 180, default=DEFAULT_TIMEOUT_SECONDS)
+                client.timeout_seconds = v
+                _print_section("Timeout updated")
+                print(f"Timeout set to {v} seconds.")
+
+            elif choice == 42:
+                client.auth_debug = not client.auth_debug
+                _print_section("Auth debug toggled")
+                print(f"Auth debug is now: {'ON' if client.auth_debug else 'OFF'}")
+
+            elif choice == 43:
+                _print_section("Switch API key")
+                print("1) Use saved credentials if present")
+                print("2) Use env var MOLTBOOK_API_KEY if present")
+                print("3) Enter API key now (hidden)")
+                print("0) Cancel")
+                c = _prompt_int("Select: ", 0, 3)
+                if c == 0:
+                    pass
+                elif c == 1:
+                    saved = _load_saved_credentials()
+                    if not saved or not saved.get("api_key"):
+                        print("No saved credentials found.")
+                    else:
+                        client.api_key = saved["api_key"]
+                        print("Active API key updated (from saved credentials).")
+                elif c == 2:
+                    env_key = _sanitize_key(os.environ.get("MOLTBOOK_API_KEY", ""))
+                    if not env_key:
+                        print("No env key found.")
+                    else:
+                        client.api_key = env_key
+                        print("Active API key updated (from env).")
+                else:
+                    k = _sanitize_key(getpass.getpass("Enter Moltbook API key (hidden): "))
+                    if not k:
+                        print("API key required.")
+                    else:
+                        client.api_key = k
+                        print("Active API key updated.")
+                        if _confirm("Save to ~/.config/moltbook/credentials.json (0600)?"):
+                            agent_name = _prompt_optional("Agent name to save (optional): ", max_len=64) or ""
+                            _save_credentials(client.api_key, agent_name)
+                            print("Saved.")
+
+        except ApiError as e:
+            _safe_show_error(e)
         except KeyboardInterrupt:
             print("\nInterrupted.")
             return
         except Exception as e:
-            _err(f"Unhandled exception: {e}")
+            print(f"\nERROR: {_truncate(str(e), 300)}")
 
-        pause()
+        input("\nPress Enter to continue...")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        menu()
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        sys.exit(130)
+    except Exception as e:
+        print(f"ERROR: {_truncate(str(e), 300)}")
+        sys.exit(1)

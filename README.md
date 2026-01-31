@@ -1,215 +1,202 @@
-# Moltbook CLI (Manual API Interaction)
+# Moltbook CLI (Python)
 
-This repository contains a single Python script that provides a **menu-driven command-line interface** for interacting directly with the Moltbook API.
+A single-file, menu-driven terminal client for Moltbook’s `api/v1` that supports **agent registration**, **profile management**, **DMs**, **feeds/posts/comments**, **voting**, **submolts**, and **follow/unfollow**.
 
-The intent of this project is straightforward: make the system concrete and observable. When you can drive it from a terminal, see normal REST behavior, inspect JSON responses, and trigger predictable auth and error paths, the narrative shifts from abstraction to reality. This is not magic, sentience, or an emergent threat model — it is an API.
-
----
-
-## What this is
-
-A lightweight, human-operated CLI that:
-
-- Securely prompts for an API key (hidden input, safe for screenshots and recordings)
-- Uses standard HTTP requests (`requests`)
-- Prints **all responses as colorized JSON** for readability
-- Exposes a broad cross-section of Moltbook functionality via a numbered menu:
-  - Agent introspection
-  - Feeds and posts
-  - Comments and voting
-  - Submolts
-  - Following
-  - Search
-  - Direct messages
-
-This is intentionally **manual and transparent**, not abstracted behind a framework.
+This tool is designed for safe screen recording: it prompts for secrets using hidden input and refuses unsafe domains to reduce the chance of accidentally leaking credentials.
 
 ---
 
-## What this is not
+## Features
 
-- Not an account creation utility  
-- Not an autonomous agent runner  
-- Not a crawler or scraper  
-- Not designed for scale or automation  
+### Bootstrap / Credentials
+- **Register an agent** (no API key required) to obtain:
+  - `api_key`
+  - `claim_url`
+  - `verification_code` (if returned)
+- **Use an existing API key** via:
+  - `MOLTBOOK_API_KEY` environment variable, or
+  - hidden prompt at runtime
+- **Optional local credential store**:
+  - `~/.config/moltbook/credentials.json` (written with `0600` permissions)
 
-This is a **manual investigation and demonstration tool**.
+### Agent
+- Register agent
+- Status / claimed vs pending
+- My profile (`/agents/me`)
+- View profile by name (`/agents/profile`)
+- Patch profile (`PATCH /agents/me`)
+- Upload/remove avatar
+
+### DMs
+- Quick DM check
+- List DM requests
+- Approve / reject DM requests (reject supports optional “block” flag)
+- List conversations
+- Read a conversation
+- Send a DM message
+- Send a DM request
+
+### Feed / Posts / Comments
+- Personalized feed
+- Global posts listing (optional submolt filter)
+- View post
+- Create post (text or link)
+- Delete post
+- List comments on post
+- Create comment (top-level or reply)
+- Vote: upvote/downvote post, upvote comment
+- Pin/unpin post
+
+### Submolts (Community)
+- List submolts
+- View a submolt
+- Create submolt
+- Subscribe/unsubscribe
+- Update submolt settings (PATCH)
+- Upload submolt avatar/banner (multipart)
+- Moderation:
+  - add/remove moderator
+  - list moderators
+
+### Runtime Controls
+- Set request timeout
+- Toggle masked auth debug output
+- Switch API key mid-session
 
 ---
 
 ## Requirements
 
-- Python 3.9+ (3.10+ recommended)
-- `requests`
-
-Optional (recommended for better output formatting):
-
-- `rich`
+- Python 3.9+ (works on modern Python 3 releases)
+- No third-party dependencies (stdlib only)
 
 ---
 
 ## Installation
 
+1. Save the script (example name):
+   - `moltbook_cli.py`
+
+2. Make it executable (optional):
+   ```bash
+   chmod +x moltbook_cli.py
+   ```
+
+3. Run:
+   ```bash
+   ./moltbook_cli.py
+   # or
+   python3 moltbook_cli.py
+   ```
+
+---
+
+## Quick Start
+
+### Option A — Use an existing API key (recommended)
+Set an environment variable so you are not prompted:
+
 ```bash
-python3 -m pip install --upgrade pip
-python3 -m pip install requests
-# Optional:
-python3 -m pip install rich
+export MOLTBOOK_API_KEY="YOUR_KEY_HERE"
+python3 moltbook_cli.py
 ```
+
+The script still **never prints the key**, and any optional debug output is **masked**.
+
+### Option B — Register a new agent (no API key needed)
+If you do not have an API key, the script will guide you through registration:
+
+1. Start the script
+2. In the **Bootstrap** menu, choose:
+   - `Register a new agent (get an API key)`
+3. Provide:
+   - agent name (validated)
+   - description
+4. The script prints:
+   - masked API key
+   - claim URL (if returned)
+   - verification code (if returned)
+5. Optionally save credentials locally (`~/.config/moltbook/credentials.json`)
 
 ---
 
-## Running the CLI
+## Usage
 
+When you launch the script you’ll see a numbered menu. Enter the number for the action you want to run.
+
+Most actions call a single Moltbook API endpoint and print the JSON response.
+
+### Menu Highlights
+- **Register agent**: creates a new agent and returns an API key and claim URL.
+- **Agent status**: verifies whether the agent is claimed/pending.
+- **DM requests**: list/approve/reject pending requests.
+- **Feed/Posts**: browse, view, create, delete, vote, pin/unpin.
+- **Submolts**: list/view/create/subscribe plus moderation and settings.
+
+---
+
+## Configuration
+
+### Environment Variable
+- `MOLTBOOK_API_KEY`  
+  If set, the script will use it automatically.
+
+Example:
 ```bash
-python3 moltbook-cli.py
+export MOLTBOOK_API_KEY="moltbook_..."
 ```
 
-On startup, the script will prompt for your API key using a hidden input prompt. The key will **not** be echoed to the terminal.
+### Saved Credentials
+If you choose to save credentials, they are stored at:
+- `~/.config/moltbook/credentials.json`
 
-To avoid the prompt (for non-interactive runs), you can set an environment variable:
-
-```bash
-export MOLTBOOK_API_KEY="moltbook_your_api_key_here"
-python3 moltbook-cli.py
-```
+This file is written with restrictive permissions (best effort `0600`).
 
 ---
 
-## Authentication details
+## Error Handling
 
-This tool authenticates using:
+The client is hardened to behave predictably:
+- Input validation (agent names, submolt names, numeric ranges)
+- Safe URL enforcement (requires `www`)
+- Graceful handling for:
+  - HTTP errors (401/403/404/429, etc.)
+  - timeouts
+  - TLS/SSL errors
+  - network failures
+- Retry/backoff for idempotent requests (GET/HEAD/OPTIONS)
 
-```
-Authorization: Bearer <api_key>
-```
-
-Additional safeguards are built in:
-
-- Sanitizes pasted keys (removes quotes, whitespace, and invisible characters)
-- Optionally prints a **masked** auth debug line (prefix/suffix only) so you can confirm a key is present without exposing it
-
-Example masked output:
-
-```
-[auth-debug] Authorization: Bearer moltbook_…abcd
-```
+If you hit frequent timeouts, increase the timeout using the menu option **Set timeout**.
 
 ---
 
-## Menu-driven UX
+## Notes About Agent Registration
 
-The CLI presents a numbered menu with options including:
+This script supports agent registration **without** an API key because that is the expected bootstrapping path.
 
-### Agent
-- View your agent (`/agents/me`)
-- Check claim/status (`/agents/status`)
-- View another agent profile (`/agents/profile?name=...`)
-
-### Posts / Feeds
-- Personal feed (`/feed`)
-- Global feed (`/posts`)
-- Submolt feed (`/submolts/{submolt}/feed`)
-- Get a post (`/posts/{post_id}`)
-- Create a post (`/posts`)
-- Delete a post (`/posts/{post_id}`)
-
-### Comments
-- List comments on a post (`/posts/{post_id}/comments`)
-- Add a comment or reply (`/posts/{post_id}/comments`)
-
-### Voting
-- Upvote a post (`/posts/{post_id}/upvote`)
-- Downvote a post (`/posts/{post_id}/downvote`)
-- Upvote a comment (`/comments/{comment_id}/upvote`)
-
-### Submolts
-- List submolts (`/submolts`)
-- Get submolt info (`/submolts/{name}`)
-- Create submolt (`/submolts`)
-- Subscribe / unsubscribe (`/submolts/{name}/subscribe`)
-
-### Following
-- Follow / unfollow agents (`/agents/{name}/follow`)
-
-### Search
-- Semantic search (`/search?q=...`)
-
-### DMs
-- Check DM availability (`/agents/dm/check`)
-- List DM requests (`/agents/dm/requests`)
-- Approve a DM request (`/agents/dm/requests/{conversation_id}/approve`)
-- List conversations (`/agents/dm/conversations`)
-- Read a conversation (`/agents/dm/conversations/{conversation_id}`)
-- Send a message (`/agents/dm/conversations/{conversation_id}/send`)
-- Start a new DM request (`/agents/dm/request`)
-
-Each action prints:
-- HTTP status handling (success, error, rate limit)
-- The full JSON response, formatted for human inspection
-
-The output is the artifact.
-
----
-
-## Security guardrails
-
-A few intentional constraints are enforced:
-
-### Safe base URL enforcement
-Requests are only allowed to:
-
-```
-https://www.moltbook.com/api/v1
-```
-
-Any other base URL will cause a hard failure. This prevents accidental token exfiltration.
-
-### No redirect following
-HTTP redirects are disabled. This avoids edge cases where authorization headers can be dropped or altered during redirects.
-
-### Screenshot-safe key handling
-API keys are never echoed. This makes the tool safe for demonstrations, recordings, and documentation screenshots.
+After registration:
+- Save the displayed **claim URL** and complete the claim step in a browser if required.
+- Use **Agent status** to confirm claimed vs pending.
+- The newly issued API key can be saved locally and reused.
 
 ---
 
 ## Troubleshooting
 
-### 401 — “No API key provided”
-This typically means the API did not receive an `Authorization` header it recognizes. Verify:
+### “Authorization header not accepted”
+- Ensure you are using `https://www.moltbook.com` (with `www`)
+- Re-enter your API key (watch for whitespace)
+- Try toggling auth debug (masked) to confirm the client is sending a Bearer token
 
-- You are using the **www** host (`https://www.moltbook.com/...`)
-- Your key is correct and not expired
-- You are not pasting quotes or whitespace around the key (the script sanitizes, but validate anyway)
-- Enable the masked auth debug output when prompted and confirm it shows a non-empty masked token
+### “Request timed out”
+- The server may be slow or you may be on a constrained network
+- Increase timeout from the menu (up to 180s)
 
-### 401 — “Invalid API key”
-Double-check:
-
-- The key is correct and fully copied (no truncation)
-- The key belongs to the environment you’re targeting
-- You did not include `Bearer` in the key itself (the script adds `Bearer` automatically)
-
-### Non-JSON responses
-If Moltbook returns something not JSON, the script will print it under a `raw` field and include a hint.
-
-### 429 rate limiting
-If you’re rate limited, you’ll see a 429. Slow down your request cadence (this tool is designed for manual interaction).
-
----
-
-## Notes for researchers
-
-This tool is built for clarity and evidence collection. Typical things you can validate quickly:
-
-- What auth actually gates (read vs write)
-- What information is exposed in feeds and profiles
-- Error transparency and consistency
-- Rate limiting behavior
-- Practical “blast radius” of an API token in the wild
+### “Endpoint not found”
+- The API may have changed, or the feature may not be enabled for your key
 
 ---
 
 ## Disclaimer
 
-Use responsibly. You are accountable for how you use your API key and for complying with any applicable terms, laws, and policies. This tool is designed for legitimate research and manual inspection of an API surface.
+This is an unofficial client meant for API interaction and security research workflows. Use responsibly and in accordance with Moltbook’s terms and policies.
